@@ -20,6 +20,15 @@ class AccidentEvent {
   };
 }
 
+/// Data model for periodic location updates from ESP32.
+class LocationEvent {
+  final String deviceId;
+  final double lat;
+  final double lon;
+
+  LocationEvent({required this.deviceId, required this.lat, required this.lon});
+}
+
 /// BLE service that scans, connects, and listens to the ESP32 accident device.
 class BleService {
   static const String deviceName = 'Accident_Device_ESP32';
@@ -36,12 +45,16 @@ class BleService {
   bool _deviceFound = false;
 
   final _accidentController = StreamController<AccidentEvent>.broadcast();
+  final _locationController = StreamController<LocationEvent>.broadcast();
   final _statusController = StreamController<String>.broadcast();
   final _connectionStateController =
       StreamController<BleConnectionState>.broadcast();
 
   /// Stream of accident events received via BLE
   Stream<AccidentEvent> get accidentStream => _accidentController.stream;
+
+  /// Stream of periodic location events received via BLE.
+  Stream<LocationEvent> get locationStream => _locationController.stream;
 
   /// Stream of status messages for UI display
   Stream<String> get statusStream => _statusController.stream;
@@ -51,6 +64,38 @@ class BleService {
       _connectionStateController.stream;
 
   bool get isConnected => _connectedDevice != null;
+
+  String get connectedDeviceName {
+    final device = _connectedDevice;
+    if (device == null) return 'Unknown';
+    final name = device.platformName;
+    if (name.isNotEmpty) return name;
+    return device.remoteId.toString();
+  }
+
+  /// Reads battery level from standard BLE Battery Service when available.
+  Future<int?> readBatteryLevel() async {
+    final device = _connectedDevice;
+    if (device == null) return null;
+
+    try {
+      final services = await device.discoverServices();
+      for (final service in services) {
+        if (service.uuid.toString().toLowerCase() ==
+            '0000180f-0000-1000-8000-00805f9b34fb') {
+          for (final c in service.characteristics) {
+            if (c.uuid.toString().toLowerCase() ==
+                '00002a19-0000-1000-8000-00805f9b34fb') {
+              final value = await c.read();
+              if (value.isNotEmpty) return value.first;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    return null;
+  }
 
   /// Start scanning for the ESP32 device
   Future<void> startScan() async {
@@ -180,21 +225,31 @@ class BleService {
     _statusController.add('Accident characteristic not found on device.');
   }
 
-  /// Parse the BLE data from ESP32
-  /// Expected format: ACCIDENT|device_id|lat|lon
+  /// Parse BLE payload from ESP32.
+  /// Supported formats:
+  /// - ACCIDENT|device_id|lat|lon
+  /// - LOCATION|device_id|lat|lon
   void _handleBleData(List<int> data) {
     try {
       final message = utf8.decode(data);
       _statusController.add('Received: $message');
 
       final parts = message.split('|');
-      if (parts.length >= 4 && parts[0] == 'ACCIDENT') {
-        final event = AccidentEvent(
-          deviceId: parts[1],
-          lat: double.parse(parts[2]),
-          lon: double.parse(parts[3]),
-        );
-        _accidentController.add(event);
+      if (parts.length >= 4) {
+        final type = parts[0];
+        final deviceId = parts[1];
+        final lat = double.parse(parts[2]);
+        final lon = double.parse(parts[3]);
+
+        if (type == 'ACCIDENT') {
+          _accidentController.add(
+            AccidentEvent(deviceId: deviceId, lat: lat, lon: lon),
+          );
+        } else if (type == 'LOCATION') {
+          _locationController.add(
+            LocationEvent(deviceId: deviceId, lat: lat, lon: lon),
+          );
+        }
       }
     } catch (e) {
       _statusController.add('Parse error: $e');
@@ -222,6 +277,7 @@ class BleService {
     _notifySubscription?.cancel();
     _connectionSubscription?.cancel();
     _accidentController.close();
+    _locationController.close();
     _statusController.close();
     _connectionStateController.close();
   }

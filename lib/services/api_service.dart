@@ -197,6 +197,36 @@ class ApiService {
     }
   }
 
+  static Future<ApiResponse> updateContact({
+    required int id,
+    required String name,
+    required String phone,
+    String? telegramId,
+    String? relationship,
+  }) async {
+    try {
+      final response = await http.put(
+        Uri.parse('$baseUrl/contacts/$id'),
+        headers: await _authHeaders(),
+        body: jsonEncode({
+          'name': name,
+          'phone': phone,
+          'telegram_id': telegramId,
+          'relationship': relationship,
+        }),
+      );
+
+      final data = jsonDecode(response.body) as Map<String, dynamic>;
+      return ApiResponse(
+        success: response.statusCode == 200,
+        data: data,
+        error: response.statusCode != 200 ? data['error'] as String? : null,
+      );
+    } catch (e) {
+      return ApiResponse(success: false, error: 'Connection error: $e');
+    }
+  }
+
   static Future<ApiResponse> deleteContact(int id) async {
     try {
       final response = await http.delete(

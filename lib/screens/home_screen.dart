@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../services/api_service.dart';
 import '../services/ble_service.dart';
 import '../services/webhook_service.dart';
+import '../widgets/glass_card.dart';
 import 'accident_alert_screen.dart';
 import 'contacts_screen.dart';
 import 'login_screen.dart';
@@ -23,39 +24,62 @@ class _HomeScreenState extends State<HomeScreen> {
   final BleService _bleService = BleService();
   final WebhookService _webhookService = WebhookService();
 
-  final List<String> _logs = [];
   BleConnectionState _connectionState = BleConnectionState.disconnected;
   bool _alertShowing = false;
+  String _deviceName = '--';
+  String _batteryText = '--';
+  double? _lastLat;
+  double? _lastLon;
 
   late StreamSubscription<String> _statusSub;
   late StreamSubscription<BleConnectionState> _connectionSub;
   late StreamSubscription<AccidentEvent> _accidentSub;
+  late StreamSubscription<LocationEvent> _locationSub;
 
   @override
   void initState() {
     super.initState();
 
-    _statusSub = _bleService.statusStream.listen((msg) {
-      setState(() {
-        _logs.add('[${_timeStamp()}] $msg');
-        if (_logs.length > 100) _logs.removeAt(0);
-      });
-    });
+    _statusSub = _bleService.statusStream.listen((_) {});
 
     _connectionSub = _bleService.connectionStateStream.listen((state) {
       setState(() => _connectionState = state);
+      if (state == BleConnectionState.connected) {
+        _refreshDeviceDetails();
+      }
+      if (state == BleConnectionState.disconnected) {
+        setState(() {
+          _deviceName = '--';
+          _batteryText = '--';
+          _lastLat = null;
+          _lastLon = null;
+        });
+      }
     });
 
     _accidentSub = _bleService.accidentStream.listen((event) {
+      setState(() {
+        _lastLat = event.lat;
+        _lastLon = event.lon;
+      });
       _onAccidentDetected(event);
+    });
+
+    _locationSub = _bleService.locationStream.listen((event) {
+      setState(() {
+        _lastLat = event.lat;
+        _lastLon = event.lon;
+      });
     });
   }
 
-  String _timeStamp() {
-    final now = DateTime.now();
-    return '${now.hour.toString().padLeft(2, '0')}:'
-        '${now.minute.toString().padLeft(2, '0')}:'
-        '${now.second.toString().padLeft(2, '0')}';
+  Future<void> _refreshDeviceDetails() async {
+    final battery = await _bleService.readBatteryLevel();
+    if (!mounted) return;
+    setState(() {
+      _deviceName = _bleService.connectedDeviceName;
+      _batteryText = battery == null ? 'Unknown' : '$battery%';
+    });
   }
 
   Future<void> _requestPermissions() async {
@@ -72,7 +96,12 @@ class _HomeScreenState extends State<HomeScreen> {
     // Check if Bluetooth is on
     final adapterState = await FlutterBluePlus.adapterState.first;
     if (adapterState != BluetoothAdapterState.on) {
-      _addLog('Bluetooth is OFF. Please enable Bluetooth.');
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Bluetooth is OFF. Please enable Bluetooth.'),
+        ),
+      );
       return;
     }
 
@@ -83,10 +112,6 @@ class _HomeScreenState extends State<HomeScreen> {
   void _onAccidentDetected(AccidentEvent event) {
     if (_alertShowing) return;
     _alertShowing = true;
-
-    _addLog(
-      '⚠️ ACCIDENT EVENT: ${event.deviceId} @ ${event.lat}, ${event.lon}',
-    );
 
     Navigator.of(context)
         .push(
@@ -100,11 +125,42 @@ class _HomeScreenState extends State<HomeScreen> {
         .then((_) => _alertShowing = false);
   }
 
-  void _addLog(String msg) {
-    setState(() {
-      _logs.add('[${_timeStamp()}] $msg');
-      if (_logs.length > 100) _logs.removeAt(0);
-    });
+  void _openContacts() {
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const ContactsScreen()));
+  }
+
+  Future<void> _logout() async {
+    await ApiService.logout();
+    if (!context.mounted) return;
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (route) => false,
+    );
+  }
+
+  void _showSettingsCard() {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (ctx) => SafeArea(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Card(
+            child: ListTile(
+              leading: const Icon(Icons.logout, color: Colors.redAccent),
+              title: const Text('Logout'),
+              subtitle: const Text('Sign out from this device'),
+              onTap: () {
+                Navigator.of(ctx).pop();
+                _logout();
+              },
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   @override
@@ -112,6 +168,7 @@ class _HomeScreenState extends State<HomeScreen> {
     _statusSub.cancel();
     _connectionSub.cancel();
     _accidentSub.cancel();
+    _locationSub.cancel();
     _bleService.dispose();
     super.dispose();
   }
@@ -120,229 +177,316 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('VT Accident Detection'),
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
+        title: const Text('Acci-Alert'),
         actions: [
           IconButton(
-            icon: const Icon(Icons.contacts),
-            tooltip: 'Emergency Contacts',
-            onPressed: () {
-              Navigator.of(
-                context,
-              ).push(MaterialPageRoute(builder: (_) => const ContactsScreen()));
-            },
+            icon: const Icon(Icons.settings),
+            tooltip: 'Settings',
+            onPressed: _showSettingsCard,
           ),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            tooltip: 'Logout',
-            onPressed: () async {
-              await ApiService.logout();
-              if (!context.mounted) return;
-              Navigator.of(context).pushAndRemoveUntil(
-                MaterialPageRoute(builder: (_) => const LoginScreen()),
-                (route) => false,
-              );
-            },
-          ),
-          _connectionIndicator(),
           const SizedBox(width: 12),
         ],
       ),
-      body: Column(
-        children: [
-          // Status card
-          _buildStatusCard(),
-
-          // Action buttons
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            child: Row(
-              children: [
-                Expanded(
-                  child: ElevatedButton.icon(
-                    onPressed:
-                        _connectionState == BleConnectionState.scanning ||
-                            _connectionState == BleConnectionState.connecting
-                        ? null
-                        : _connectionState == BleConnectionState.connected
-                        ? () => _bleService.disconnect()
-                        : _handleScan,
-                    icon: Icon(
-                      _connectionState == BleConnectionState.connected
-                          ? Icons.bluetooth_disabled
-                          : Icons.bluetooth_searching,
-                    ),
-                    label: Text(
-                      _connectionState == BleConnectionState.connected
-                          ? 'Disconnect'
-                          : _connectionState == BleConnectionState.scanning
-                          ? 'Scanning...'
-                          : _connectionState == BleConnectionState.connecting
-                          ? 'Connecting...'
-                          : 'Scan & Connect',
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                // Test button — sends a fake accident event for testing
-                ElevatedButton.icon(
-                  onPressed: () {
-                    _onAccidentDetected(
-                      AccidentEvent(
-                        deviceId: 'esp32_001_test',
-                        lat: 20.363743,
-                        lon: 85.815004,
-                      ),
-                    );
-                  },
-                  icon: const Icon(Icons.bug_report),
-                  label: const Text('Test Alert'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.orange,
-                    foregroundColor: Colors.white,
-                  ),
-                ),
-              ],
-            ),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [Color(0xFF1A212B), Color(0xFF0F1318), Color(0xFF1E171E)],
           ),
-
-          // Logs
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Row(
-              children: [
-                const Text(
-                  'Event Log',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                ),
-                const Spacer(),
-                TextButton(
-                  onPressed: () => setState(() => _logs.clear()),
-                  child: const Text('Clear'),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: Container(
-              margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                color: Colors.grey.shade900,
-                borderRadius: BorderRadius.circular(12),
+        ),
+        child: Column(
+          children: [
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                child: _connectionState == BleConnectionState.connected
+                    ? _buildConnectedView()
+                    : _buildBleButtonView(),
               ),
-              child: _logs.isEmpty
-                  ? const Center(
-                      child: Text(
-                        'No events yet. Tap "Scan & Connect" to start.',
-                        style: TextStyle(color: Colors.white54),
-                      ),
-                    )
-                  : ListView.builder(
-                      reverse: true,
-                      itemCount: _logs.length,
-                      itemBuilder: (_, i) {
-                        final log = _logs[_logs.length - 1 - i];
-                        return Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 2),
-                          child: Text(
-                            log,
-                            style: TextStyle(
-                              color: log.contains('ACCIDENT')
-                                  ? Colors.redAccent
-                                  : log.contains('Connected')
-                                  ? Colors.greenAccent
-                                  : Colors.white70,
-                              fontFamily: 'monospace',
-                              fontSize: 13,
-                            ),
-                          ),
-                        );
-                      },
-                    ),
             ),
+            if (_connectionState != BleConnectionState.connected)
+              SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+                  child: ElevatedButton.icon(
+                    onPressed: _openContacts,
+                    icon: const Icon(Icons.contacts),
+                    label: const Text('Emergency Contacts'),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Color _statusColor() {
+    switch (_connectionState) {
+      case BleConnectionState.disconnected:
+        return Colors.redAccent;
+      case BleConnectionState.scanning:
+      case BleConnectionState.connecting:
+        return Colors.amber;
+      case BleConnectionState.connected:
+        return Colors.greenAccent;
+    }
+  }
+
+  String _statusLabel() {
+    switch (_connectionState) {
+      case BleConnectionState.disconnected:
+        return 'Disconnected';
+      case BleConnectionState.scanning:
+        return 'Searching...';
+      case BleConnectionState.connecting:
+        return 'Connecting...';
+      case BleConnectionState.connected:
+        return 'Connected';
+    }
+  }
+
+  Widget _buildBleButtonView() {
+    final disabled =
+        _connectionState == BleConnectionState.scanning ||
+        _connectionState == BleConnectionState.connecting;
+
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          GestureDetector(
+            onTap: disabled ? null : _handleScan,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 220),
+              width: 210,
+              height: 210,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF232C39),
+                border: Border.all(color: _statusColor(), width: 6),
+                boxShadow: [
+                  BoxShadow(
+                    color: _statusColor().withValues(alpha: 0.28),
+                    blurRadius: 18,
+                    spreadRadius: 4,
+                  ),
+                ],
+              ),
+              child: Icon(Icons.bluetooth, size: 110, color: _statusColor()),
+            ),
+          ),
+          const SizedBox(height: 20),
+          Text(
+            _statusLabel(),
+            style: TextStyle(
+              color: _statusColor(),
+              fontSize: 22,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Tap the button to scan and connect',
+            style: TextStyle(color: Colors.white70),
           ),
         ],
       ),
     );
   }
 
-  Widget _connectionIndicator() {
-    Color color;
-    String tooltip;
-
-    switch (_connectionState) {
-      case BleConnectionState.connected:
-        color = Colors.green;
-        tooltip = 'Connected';
-      case BleConnectionState.scanning:
-        color = Colors.orange;
-        tooltip = 'Scanning';
-      case BleConnectionState.connecting:
-        color = Colors.yellow;
-        tooltip = 'Connecting';
-      case BleConnectionState.disconnected:
-        color = Colors.red;
-        tooltip = 'Disconnected';
-    }
-
-    return Tooltip(
-      message: tooltip,
-      child: Container(
-        width: 14,
-        height: 14,
-        decoration: BoxDecoration(
-          color: color,
-          shape: BoxShape.circle,
-          border: Border.all(color: Colors.white, width: 1.5),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildStatusCard() {
-    return Card(
-      margin: const EdgeInsets.all(16),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Row(
-          children: [
-            Icon(
-              _connectionState == BleConnectionState.connected
-                  ? Icons.bluetooth_connected
-                  : Icons.bluetooth_disabled,
-              size: 40,
-              color: _connectionState == BleConnectionState.connected
-                  ? Colors.blue
-                  : Colors.grey,
-            ),
-            const SizedBox(width: 16),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+  Widget _buildConnectedView() {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.start,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SizedBox(height: 6),
+        GlassCard(
+          margin: EdgeInsets.zero,
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
                 children: [
-                  Text(
-                    _connectionState == BleConnectionState.connected
-                        ? 'Device Connected'
-                        : 'No Device Connected',
-                    style: const TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize: 16,
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.greenAccent.withValues(alpha: 0.15),
+                      shape: BoxShape.circle,
+                    ),
+                    child: const Icon(
+                      Icons.bluetooth_connected,
+                      color: Colors.greenAccent,
+                      size: 28,
                     ),
                   ),
-                  const SizedBox(height: 4),
-                  Text(
-                    _connectionState == BleConnectionState.connected
-                        ? 'Listening for accident events...'
-                        : 'Tap "Scan & Connect" to pair with ESP32',
-                    style: TextStyle(color: Colors.grey.shade600, fontSize: 14),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Active Device',
+                          style: TextStyle(
+                            fontSize: 13,
+                            color: Colors.white70,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                        Text(
+                          _deviceName,
+                          style: const TextStyle(
+                            fontSize: 22,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ],
               ),
-            ),
-          ],
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Theme.of(
+                    context,
+                  ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.3),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(
+                    color: Theme.of(
+                      context,
+                    ).colorScheme.outlineVariant.withValues(alpha: 0.3),
+                  ),
+                ),
+                child: Column(
+                  children: [
+                    _deviceDetailBlock(
+                      context,
+                      icon: Icons.battery_charging_full_rounded,
+                      header: 'Battery Remaining',
+                      value: _batteryText,
+                      valueColor: _batteryText.contains('%')
+                          ? ((int.tryParse(_batteryText.replaceAll('%', '')) ??
+                                        100) >
+                                    20
+                                ? Colors.greenAccent
+                                : Colors.redAccent)
+                          : null,
+                    ),
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: Divider(height: 1),
+                    ),
+                    _deviceDetailBlock(
+                      context,
+                      icon: Icons.location_on_outlined,
+                      header: 'Last Known Location',
+                      value: _lastLat != null && _lastLon != null
+                          ? '${_lastLat!.toStringAsFixed(5)}, ${_lastLon!.toStringAsFixed(5)}'
+                          : 'Waiting for GPS...',
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
         ),
-      ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: () => _bleService.disconnect(),
+          icon: const Icon(Icons.bluetooth_disabled),
+          style: FilledButton.styleFrom(
+            backgroundColor: Colors.redAccent.withValues(alpha: 0.15),
+            foregroundColor: Colors.redAccent,
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+          ),
+          label: const Text(
+            'Disconnect Device',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+        ),
+        const SizedBox(height: 10),
+        OutlinedButton.icon(
+          onPressed: _openContacts,
+          icon: const Icon(Icons.contacts),
+          style: OutlinedButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 12),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+            ),
+          ),
+          label: const Text(
+            'Emergency Contacts',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _deviceDetailBlock(
+    BuildContext context, {
+    required IconData icon,
+    required String header,
+    required String value,
+    Color? valueColor,
+  }) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: Theme.of(
+              context,
+            ).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+            shape: BoxShape.circle,
+          ),
+          child: Icon(
+            icon,
+            size: 22,
+            color: Theme.of(
+              context,
+            ).colorScheme.onSurface.withValues(alpha: 0.8),
+          ),
+        ),
+        const SizedBox(width: 14),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                header,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.3,
+                  color: Theme.of(
+                    context,
+                  ).colorScheme.onSurface.withValues(alpha: 0.75),
+                ),
+              ),
+              const SizedBox(height: 2),
+              Text(
+                value,
+                style: TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                  color: valueColor,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
