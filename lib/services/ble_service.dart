@@ -43,6 +43,7 @@ class BleService {
   StreamSubscription<List<int>>? _notifySubscription;
   StreamSubscription<BluetoothConnectionState>? _connectionSubscription;
   bool _deviceFound = false;
+  bool _scanInProgress = false;
 
   final _accidentController = StreamController<AccidentEvent>.broadcast();
   final _locationController = StreamController<LocationEvent>.broadcast();
@@ -99,6 +100,13 @@ class BleService {
 
   /// Start scanning for the ESP32 device
   Future<void> startScan() async {
+    // Prevent concurrent scan attempts
+    if (_scanInProgress) {
+      _statusController.add('Scan already in progress.');
+      return;
+    }
+
+    _scanInProgress = true;
     _deviceFound = false;
     _statusController.add('Scanning for $deviceName...');
     _connectionStateController.add(BleConnectionState.scanning);
@@ -108,22 +116,10 @@ class BleService {
     _scanSubscription = null;
     await FlutterBluePlus.stopScan();
 
-    // First check if already bonded/system-connected from a previous session
-    try {
-      final systemDevices = await FlutterBluePlus.systemDevices([
-        Guid(serviceUuid),
-      ]);
-      for (var device in systemDevices) {
-        final name = device.platformName;
-        if (name == deviceName || name.contains('Accident')) {
-          _deviceFound = true;
-          _statusController.add('Found $name in system devices!');
-          _connectToDevice(device);
-          return;
-        }
-      }
-    } catch (_) {}
+    // Brief delay for Android system to stabilize (prevent "scanning too frequently" error)
+    await Future.delayed(const Duration(milliseconds: 100));
 
+    // Set up listener BEFORE checking system devices or starting scan
     _scanSubscription = FlutterBluePlus.onScanResults.listen((results) {
       for (var result in results) {
         final platformName = result.device.platformName;
@@ -147,6 +143,7 @@ class BleService {
 
         if (nameMatch || uuidMatch) {
           _deviceFound = true;
+          _scanInProgress = false;
           _statusController.add('>>> Matched ESP32: $name [$mac]');
           FlutterBluePlus.stopScan();
           _scanSubscription?.cancel();
@@ -157,10 +154,36 @@ class BleService {
       }
     });
 
-    await FlutterBluePlus.startScan(
-      timeout: const Duration(seconds: 15),
-      androidUsesFineLocation: true,
-    );
+    // First check if already bonded/system-connected from a previous session
+    try {
+      final systemDevices = await FlutterBluePlus.systemDevices([]);
+      for (var device in systemDevices) {
+        final name = device.platformName;
+        if (name == deviceName || name.contains('Accident')) {
+          _deviceFound = true;
+          _scanInProgress = false;
+          _statusController.add('Found $name in system devices!');
+          _connectToDevice(device);
+          return;
+        }
+      }
+    } catch (e) {
+      _statusController.add('System device check: $e');
+    }
+
+    try {
+      await FlutterBluePlus.startScan(
+        timeout: const Duration(seconds: 15),
+        androidUsesFineLocation: true,
+      );
+    } catch (e) {
+      _statusController.add('Scan failed: $e');
+      _connectionStateController.add(BleConnectionState.disconnected);
+      _scanInProgress = false;
+      return;
+    }
+
+    _scanInProgress = false;
 
     // Only show "not found" if scan completed without finding device
     if (!_deviceFound && _connectedDevice == null) {
@@ -258,6 +281,7 @@ class BleService {
 
   /// Disconnect from the device
   Future<void> disconnect() async {
+    _scanInProgress = false;
     await _notifySubscription?.cancel();
     _notifySubscription = null;
     await _connectionSubscription?.cancel();
